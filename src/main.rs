@@ -1,0 +1,276 @@
+//! Silt — terminal-native Linux storage cleaner.
+
+mod app;
+mod config;
+mod distro;
+mod packages;
+mod scanner;
+mod targets;
+mod ui;
+
+use std::path::PathBuf;
+
+use anyhow::{bail, Result};
+use clap::Parser;
+use serde_json::json;
+
+use crate::app::App;
+use crate::config::Config;
+use crate::distro::SystemProfile;
+use crate::targets::{build_registry, RiskTier};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "silt",
+    version,
+    about = "Terminal-native Linux storage cleaner: scan, visualize, clean."
+)]
+struct Cli {
+    /// Output scan results and target sizes as JSON (headless, no TUI).
+    #[arg(long)]
+    json: bool,
+
+    /// Execute cleanup without the TUI. Requires --target or --all-safe.
+    #[arg(long)]
+    yes: bool,
+
+    /// Cleanup target id(s) to execute headlessly (repeatable).
+    #[arg(long = "target", value_name = "ID")]
+    targets: Vec<String>,
+
+    /// With --yes and no explicit --target: run every Safe-tier target.
+    #[arg(long)]
+    all_safe: bool,
+
+    /// Also allow Moderate-tier targets in headless mode.
+    #[arg(long)]
+    include_moderate: bool,
+
+    /// List detected cleanup targets and exit.
+    #[arg(long)]
+    list_targets: bool,
+
+    /// Print detected system profile and exit.
+    #[arg(long)]
+    profile: bool,
+
+    /// Scan root for the Overview tab / --json scan (default: config or ~).
+    #[arg(long, value_name = "PATH")]
+    root: Option<PathBuf>,
+
+    /// Preview headless cleanup without executing (default unless --yes).
+    #[arg(long)]
+    dry_run: bool,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let config = Config::load()?;
+    let profile = SystemProfile::detect();
+
+    if cli.profile {
+        println!("{}", serde_json::to_string_pretty(&profile)?);
+        return Ok(());
+    }
+
+    if cli.list_targets {
+        return list_targets(&profile, &config);
+    }
+
+    if cli.json {
+        return json_report(&profile, &config, cli.root);
+    }
+
+    if cli.yes || cli.dry_run || !cli.targets.is_empty() {
+        return headless_clean(&profile, &config, &cli);
+    }
+
+    // Interactive TUI.
+    let mut config = config;
+    if let Some(root) = cli.root {
+        config.scan.default_root = root.display().to_string();
+    }
+    let terminal = &mut ratatui::init();
+    let mut app = App::new(profile, config);
+    let result = app.run(terminal);
+    ratatui::restore();
+    if result.is_ok() {
+        ui::farewell::print(&app);
+    }
+    result
+}
+
+fn list_targets(profile: &SystemProfile, config: &Config) -> Result<()> {
+    let mut registry = build_registry(profile, config);
+    for t in &mut registry {
+        t.ensure_sized();
+    }
+    println!("{:<28} {:<10} {:>12}  LABEL", "ID", "RISK", "SIZE");
+    for t in &registry {
+        println!(
+            "{:<28} {:<10} {:>12}  {}",
+            t.id,
+            t.risk.to_string(),
+            t.size_bytes.map(ui::human).unwrap_or_else(|| "?".into()),
+            t.label
+        );
+    }
+    Ok(())
+}
+
+fn json_report(profile: &SystemProfile, config: &Config, root: Option<PathBuf>) -> Result<()> {
+    let mut registry = build_registry(profile, config);
+    for t in &mut registry {
+        t.ensure_sized();
+    }
+
+    let root = root.unwrap_or_else(|| config.default_root());
+    let mounts = scanner::mounts::list_mounts();
+    // Never walk remote (cloud/network) mounts: sizing a FUSE cloud mount
+    // can force every file to download. Scanning the mount itself is allowed
+    // as an explicit choice.
+    let mut exclude = config.scan.exclude_paths.clone();
+    if !config.scan.include_remote_mounts {
+        exclude.extend(
+            mounts
+                .iter()
+                .filter(|m| m.is_remote() && m.mount_point != root)
+                .map(|m| m.mount_point.clone()),
+        );
+    }
+    let handle = scanner::start_scan(root.clone(), exclude, config.scan.follow_symlinks);
+    let mut entries = Vec::new();
+    let mut total_size = 0u64;
+    // Surface skipped remote mounts as entries (same as the TUI): size is
+    // what the remote reports as used, and it doesn't count into the local
+    // total.
+    if !config.scan.include_remote_mounts {
+        for m in mounts.iter().filter(|m| m.is_remote()) {
+            if m.mount_point.parent() == Some(root.as_path()) {
+                entries.push(json!({
+                    "path": m.mount_point,
+                    "size_bytes": m.used_bytes,
+                    "is_dir": true,
+                    "remote": true,
+                }));
+            }
+        }
+    }
+    while let Ok(event) = handle.receiver.recv() {
+        match event {
+            scanner::ScanEvent::DirScanned { path, size, is_dir } => {
+                entries.push(json!({
+                    "path": path,
+                    "size_bytes": size,
+                    "is_dir": is_dir,
+                    "remote": false,
+                }));
+            }
+            scanner::ScanEvent::Done { total_size: t } => {
+                total_size = t;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let report = json!({
+        "profile": profile,
+        "mounts": mounts,
+        "scan": {
+            "root": root,
+            "total_size_bytes": total_size,
+            "entries": entries,
+        },
+        "targets": registry.iter().map(|t| json!({
+            "id": t.id,
+            "label": t.label,
+            "category": t.category,
+            "risk": t.risk,
+            "size_bytes": t.size_bytes,
+            "description": t.description,
+            "paths": t.paths,
+        })).collect::<Vec<_>>(),
+    });
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn headless_clean(profile: &SystemProfile, config: &Config, cli: &Cli) -> Result<()> {
+    let mut registry = build_registry(profile, config);
+    for t in &mut registry {
+        t.ensure_sized();
+    }
+
+    let chosen: Vec<&targets::CleanupTarget> = if !cli.targets.is_empty() {
+        let mut chosen = Vec::new();
+        for id in &cli.targets {
+            match registry.iter().find(|t| &t.id == id) {
+                Some(t) => chosen.push(t),
+                None => bail!(
+                    "unknown target id '{id}' — run `silt --list-targets` to see available ids"
+                ),
+            }
+        }
+        chosen
+    } else if cli.all_safe {
+        registry
+            .iter()
+            .filter(|t| {
+                t.risk == RiskTier::Safe
+                    || (cli.include_moderate && t.risk == RiskTier::Moderate)
+            })
+            .collect()
+    } else {
+        bail!("headless mode needs --target=<id> (repeatable) or --all-safe");
+    };
+
+    // Guardrails: never run Caution targets headlessly without explicit
+    // --target naming them; never run Moderate without --include-moderate.
+    for t in &chosen {
+        if t.risk == RiskTier::Caution && cli.targets.is_empty() {
+            bail!("target '{}' is Caution tier; name it explicitly with --target", t.id);
+        }
+        if t.risk == RiskTier::Moderate && cli.targets.is_empty() && !cli.include_moderate {
+            bail!(
+                "target '{}' is Moderate tier; pass --include-moderate to allow",
+                t.id
+            );
+        }
+    }
+
+    let total: u64 = chosen.iter().filter_map(|t| t.size_bytes).sum();
+    println!("Selected {} target(s), ~{} reclaimable:", chosen.len(), ui::human(total));
+    for t in &chosen {
+        for line in t.dry_run_preview() {
+            println!("  {line}");
+        }
+    }
+
+    if !cli.yes {
+        println!("\nDry run only. Pass --yes to execute.");
+        return Ok(());
+    }
+
+    println!("\nExecuting…");
+    let mut failed = false;
+    for t in &chosen {
+        println!(">> {}", t.label);
+        match t.execute(true) {
+            Ok(lines) => {
+                for l in lines {
+                    println!("   {l}");
+                }
+            }
+            Err(e) => {
+                eprintln!("   ERROR: {e:#}");
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        bail!("one or more targets failed");
+    }
+    println!("Done.");
+    Ok(())
+}
