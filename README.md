@@ -3,8 +3,7 @@
   sift · settle · clean
 ```
 
-Terminal-native Linux storage cleaner. Single static Rust binary. Cache
-cleanup, disk drill-down, distro-aware cleanup.
+Terminal-native Linux storage inspector & cleaner. Interactive TUI with ncdu-style drill-down, risk-tiered cleanup targets, package size visualizer and distro-aware cache purging — all in a single ~2MB static Rust binary.
 
 ## Install
 
