@@ -10,7 +10,7 @@ Terminal-native Linux storage inspector & cleaner. Interactive TUI with ncdu-sty
 One command, any Linux distro (x86_64 or aarch64), no dependencies:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/FlyvendeMus/Silt/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Rainhexer/Silt/master/install.sh | sh
 ```
 
 Downloads a ~2MB static binary to `/usr/local/bin` (or `~/.local/bin` if not writable) and makes `silt` available in your terminal.
