@@ -1,9 +1,9 @@
 #!/bin/sh
 # Silt installer — downloads the latest static binary from GitHub releases.
-# Usage: curl -fsSL https://raw.githubusercontent.com/FlyvendeMus/Silt/master/install.sh | sh
+# Usage: curl -fsSL https://github.com/Rainhexer/Silt/releases/latest/download/install.sh | sh
 set -eu
 
-REPO="FlyvendeMus/Silt"
+REPO="Rainhexer/Silt"
 BIN="silt"
 
 case "$(uname -m)" in
