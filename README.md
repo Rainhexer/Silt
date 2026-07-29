@@ -57,4 +57,4 @@ src/
 The target registry is the only source of deletable paths. Never runs as root.
 ## License
 
-[MIT](LICENSE).
+[MIT](LICENSE)
