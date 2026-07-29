@@ -15,6 +15,8 @@ curl -fsSL https://github.com/Rainhexer/Silt/releases/latest/download/install.sh
 
 Downloads a ~2MB static binary to `/usr/local/bin` (or `~/.local/bin` if not writable) and makes `silt` available in your terminal.
 
+Re-run the same command to update to the latest release.
+
 ### From source
 
 ```bash
