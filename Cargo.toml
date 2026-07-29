@@ -1,6 +1,6 @@
 [package]
 name = "silt"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Terminal-native Linux storage cleaner: cache cleanup, disk visualization, distro-aware suggestions"
 license = "MIT"
