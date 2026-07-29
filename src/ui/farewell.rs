@@ -9,7 +9,7 @@ use crossterm::style::{Color, Stylize};
 
 use crate::app::App;
 use crate::targets::Category;
-use crate::ui::human;
+use crate::ui::{human, VERSION};
 
 const CATEGORY_ORDER: [Category; 7] = [
     Category::PackageManager,
@@ -47,10 +47,11 @@ pub fn print(app: &App) {
     println!();
     println!("     {}", "▁▂▃▄▅▆▇█▇▆▅▄▃▂▁▂▃▄▅▆▇█▇▆▅▄▃▂▁".with(faint));
     println!(
-        "     {}{}{}",
+        "     {}{}{}  {}",
         "░▒▓ ".with(accent),
         "s i l t".with(accent).bold(),
-        " ▓▒░  — the sediment has settled".with(muted)
+        " ▓▒░  — the sediment has settled".with(muted),
+        format!("v{VERSION}").with(faint)
     );
     println!("     {}", "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔".with(faint));
     println!();

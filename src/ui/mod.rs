@@ -19,6 +19,9 @@ use crate::app::{App, StatusKind, Tab};
 use crate::targets::RiskTier;
 use theme::Theme;
 
+/// Crate version, surfaced in the corner of the TUI and on the farewell screen.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub fn human(bytes: u64) -> String {
     format_size(bytes, BINARY)
 }
@@ -256,6 +259,16 @@ fn render_keys(frame: &mut Frame, app: &App, area: Rect) {
         ));
         spans.push(Span::styled(format!(" {action}"), Style::default().fg(t.muted)));
     }
+
+    // Right-aligned version stamp in the bottom corner. Dropped silently when
+    // the keybind hints already fill the row. Width-1 glyphs, so chars suffice.
+    let stamp = format!("v{VERSION} ");
+    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    if let Some(pad) = (area.width as usize).checked_sub(used + stamp.chars().count() + 2) {
+        spans.push(Span::raw(" ".repeat(pad + 2)));
+        spans.push(Span::styled(stamp, Style::default().fg(t.faint)));
+    }
+
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
