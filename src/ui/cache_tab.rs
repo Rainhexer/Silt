@@ -119,7 +119,7 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect) {
         ),
     ])];
     // Show exactly what would run/be removed: transparency beats surprise.
-    for preview in tg.dry_run_preview().into_iter().skip(1).take(3) {
+    for preview in tg.plan_preview().into_iter().skip(1).take(3) {
         lines.push(Line::from(Span::styled(
             format!("  {}", preview.trim_start()),
             Style::default().fg(t.muted),

@@ -30,7 +30,7 @@ struct Cli {
     #[arg(long)]
     json: bool,
 
-    /// Execute cleanup without the TUI. Requires --target or --all-safe.
+    /// Accepted for compatibility; headless cleanup always executes.
     #[arg(long)]
     yes: bool,
 
@@ -57,10 +57,6 @@ struct Cli {
     /// Scan root for the Overview tab / --json scan (default: config or ~).
     #[arg(long, value_name = "PATH")]
     root: Option<PathBuf>,
-
-    /// Preview headless cleanup without executing (default unless --yes).
-    #[arg(long)]
-    dry_run: bool,
 }
 
 fn main() -> Result<()> {
@@ -81,7 +77,7 @@ fn main() -> Result<()> {
         return json_report(&profile, &config, cli.root);
     }
 
-    if cli.yes || cli.dry_run || !cli.targets.is_empty() {
+    if cli.yes || cli.all_safe || !cli.targets.is_empty() {
         return headless_clean(&profile, &config, &cli);
     }
 
@@ -242,34 +238,29 @@ fn headless_clean(profile: &SystemProfile, config: &Config, cli: &Cli) -> Result
     let total: u64 = chosen.iter().filter_map(|t| t.size_bytes).sum();
     println!("Selected {} target(s), ~{} reclaimable:", chosen.len(), ui::human(total));
     for t in &chosen {
-        for line in t.dry_run_preview() {
+        for line in t.plan_preview() {
             println!("  {line}");
         }
     }
 
-    if !cli.yes {
-        println!("\nDry run only. Pass --yes to execute.");
-        return Ok(());
-    }
-
     println!("\nExecuting…");
-    let mut failed = false;
+    // Keep the sudo timestamp alive: a large cleanup can outlast it.
+    let _keepalive = targets::SudoKeepalive::start();
+    let mut failures = 0usize;
     for t in &chosen {
         println!(">> {}", t.label);
-        match t.execute(true) {
-            Ok(lines) => {
-                for l in lines {
-                    println!("   {l}");
-                }
-            }
-            Err(e) => {
-                eprintln!("   ERROR: {e:#}");
-                failed = true;
-            }
+        // Headless runs on a real terminal, so sudo may prompt directly.
+        let outcome = t.execute(true);
+        for l in outcome.log {
+            println!("   {l}");
+        }
+        for e in &outcome.errors {
+            eprintln!("   ERROR: {e}");
+            failures += 1;
         }
     }
-    if failed {
-        bail!("one or more targets failed");
+    if failures > 0 {
+        bail!("{failures} operation(s) failed — see the log above");
     }
     println!("Done.");
     Ok(())

@@ -18,7 +18,10 @@ pub fn detect(profile: &SystemProfile, config: &Config) -> Vec<CleanupTarget> {
             category: Category::SystemLogs,
             risk: RiskTier::Moderate,
             paths: vec![PathBuf::from("/var/log/journal")],
-            size_bytes: journal_disk_usage(),
+            // What the vacuum will really free, not the whole journal: the
+            // total counted everything inside the retention window, which
+            // journald keeps.
+            size_bytes: journal_vacuum_estimate(keep_days).or_else(journal_disk_usage),
             action: CleanupAction::RunCommand {
                 cmd: "journalctl".into(),
                 args: vec![format!("--vacuum-time={keep_days}d")],
@@ -82,6 +85,37 @@ fn dir_has_entries(path: &PathBuf) -> bool {
     std::fs::read_dir(path)
         .map(|mut rd| rd.next().is_some())
         .unwrap_or(false)
+}
+
+/// Bytes `journalctl --vacuum-time={keep_days}d` will actually free: journal
+/// files whose last write predates the cutoff. Journald only ever vacuums
+/// rotated journals, and their mtime is the age it compares against — so this
+/// tracks the real outcome far better than the total on-disk size does.
+/// None when no journal files are visible, so the caller falls back.
+fn journal_vacuum_estimate(keep_days: u32) -> Option<u64> {
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(u64::from(keep_days) * 86_400))?;
+    let mut total = 0u64;
+    let mut saw_journal = false;
+    for dir in ["/var/log/journal", "/run/log/journal"] {
+        for entry in walkdir::WalkDir::new(dir)
+            .follow_links(false)
+            .into_iter()
+            .flatten()
+        {
+            if !entry.file_type().is_file()
+                || !entry.file_name().to_string_lossy().contains(".journal")
+            {
+                continue;
+            }
+            saw_journal = true;
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.modified().map(|m| m < cutoff).unwrap_or(false) {
+                total += meta.len();
+            }
+        }
+    }
+    saw_journal.then_some(total)
 }
 
 /// Parse `journalctl --disk-usage`: "Archived and active journals take up 1.2G ..."

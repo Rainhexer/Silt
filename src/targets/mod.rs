@@ -9,7 +9,10 @@ pub mod system_logs;
 pub mod user_cache;
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
@@ -116,8 +119,8 @@ impl CleanupTarget {
         self.size_bytes = Some(total);
     }
 
-    /// Human-readable dry-run preview lines.
-    pub fn dry_run_preview(&self) -> Vec<String> {
+    /// Human-readable preview of exactly what executing this target will do.
+    pub fn plan_preview(&self) -> Vec<String> {
         let mut lines = vec![self.description.clone()];
         match &self.action {
             CleanupAction::DeletePathContents(paths) => {
@@ -138,41 +141,55 @@ impl CleanupTarget {
         lines
     }
 
-    /// True when executing this target would invoke sudo.
+    /// True when executing this target would invoke sudo — either because it
+    /// runs a root command, or because some path it deletes isn't ours. The
+    /// latter matters: a single root-owned `~/.cache` subdirectory used to
+    /// fail with EACCES mid-run, with no chance to authenticate.
     pub fn needs_sudo(&self) -> bool {
-        matches!(
-            &self.action,
-            CleanupAction::RunCommand { needs_root: true, .. }
-        ) && !is_root()
+        if is_root() {
+            return false;
+        }
+        match &self.action {
+            CleanupAction::RunCommand { needs_root, .. } => *needs_root,
+            CleanupAction::DeletePaths(paths) | CleanupAction::DeletePathContents(paths) => {
+                paths.iter().any(|p| path_needs_root(p))
+            }
+        }
     }
 
-    /// Execute for real. Returns human-readable log lines.
+    /// Execute for real.
     ///
-    /// `interactive_sudo` controls how root commands escalate: `true` lets
-    /// sudo prompt on the terminal (headless mode); `false` uses `sudo -n`,
-    /// which fails fast instead of blocking on a prompt the user can't see
-    /// (TUI mode — credentials must already be cached via `sudo -v`).
-    pub fn execute(&self, interactive_sudo: bool) -> Result<Vec<String>> {
-        let mut log = Vec::new();
+    /// Every path is attempted: one failure never aborts the rest of the
+    /// target, and the log is returned whether or not anything failed, so the
+    /// underlying error is always visible in the Log tab.
+    ///
+    /// `interactive_sudo` controls how root escalation works: `true` lets sudo
+    /// prompt on the terminal (headless mode, or systems that won't cache
+    /// credentials); `false` uses `sudo -n`, which fails fast instead of
+    /// blocking on a prompt the user can't see behind the TUI.
+    pub fn execute(&self, interactive_sudo: bool) -> ExecOutcome {
+        let mut out = ExecOutcome::default();
         match &self.action {
             CleanupAction::DeletePathContents(paths) => {
                 for path in paths {
-                    delete_contents(path, &mut log)?;
+                    delete_contents(path, interactive_sudo, &mut out);
                 }
             }
             CleanupAction::DeletePaths(paths) => {
                 for path in paths {
-                    if !path.exists() {
+                    if path.symlink_metadata().is_err() {
                         continue;
                     }
-                    if path.is_dir() {
-                        std::fs::remove_dir_all(path)
-                            .with_context(|| format!("removing {}", path.display()))?;
-                    } else {
-                        std::fs::remove_file(path)
-                            .with_context(|| format!("removing {}", path.display()))?;
+                    match remove_path(path, interactive_sudo) {
+                        Removal::Removed => out.log.push(format!("removed {}", path.display())),
+                        Removal::RemovedAsRoot => {
+                            out.log.push(format!("removed {} (as root)", path.display()))
+                        }
+                        Removal::Failed(e) => {
+                            out.errors.push(format!("{}: {e:#}", path.display()));
+                            out.log.push(format!("! failed {}: {e:#}", path.display()));
+                        }
                     }
-                    log.push(format!("removed {}", path.display()));
                 }
             }
             CleanupAction::RunCommand { cmd, args, needs_root } => {
@@ -187,54 +204,321 @@ impl CleanupTarget {
                 } else {
                     (cmd.clone(), args.clone())
                 };
-                log.push(format!("$ {program} {}", full_args.join(" ")));
-                let output = std::process::Command::new(&program)
-                    .args(&full_args)
-                    .output()
-                    .with_context(|| format!("running {program}"))?;
-                for line in String::from_utf8_lossy(&output.stdout).lines() {
-                    log.push(line.to_string());
-                }
-                for line in String::from_utf8_lossy(&output.stderr).lines() {
-                    log.push(format!("! {line}"));
-                }
-                if !output.status.success() {
-                    if program == "sudo" && !interactive_sudo {
-                        bail!(
-                            "sudo refused to run without a prompt (credentials \
-                             expired?) — confirm the cleanup again to re-authenticate"
-                        );
+                out.log.push(format!("$ {program} {}", full_args.join(" ")));
+                match std::process::Command::new(&program).args(&full_args).output() {
+                    Ok(output) => {
+                        for line in String::from_utf8_lossy(&output.stdout).lines() {
+                            out.log.push(line.to_string());
+                        }
+                        for line in String::from_utf8_lossy(&output.stderr).lines() {
+                            out.log.push(format!("! {line}"));
+                        }
+                        if !output.status.success() {
+                            out.errors.push(describe_command_failure(
+                                &program,
+                                &output,
+                                interactive_sudo,
+                            ));
+                        }
                     }
-                    bail!("{program} exited with {}", output.status);
+                    Err(e) => {
+                        out.errors.push(format!("running {program}: {e}"));
+                        out.log.push(format!("! running {program}: {e}"));
+                    }
                 }
             }
         }
-        Ok(log)
+        out
     }
 }
 
-fn delete_contents(dir: &PathBuf, log: &mut Vec<String>) -> Result<()> {
-    if !dir.is_dir() {
-        return Ok(());
+/// Result of executing one target: the full log (always), plus whatever went
+/// wrong (empty when the target fully succeeded).
+#[derive(Debug, Default)]
+pub struct ExecOutcome {
+    pub log: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+impl ExecOutcome {
+    pub fn ok(&self) -> bool {
+        self.errors.is_empty()
     }
-    let entries = std::fs::read_dir(dir)
-        .with_context(|| format!("reading {}", dir.display()))?;
-    let mut removed = 0u64;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let result = if path.is_dir() && !entry.file_type().map(|t| t.is_symlink()).unwrap_or(false)
-        {
-            std::fs::remove_dir_all(&path)
+}
+
+/// Why a command that exited nonzero failed. Distinguishes sudo refusing to
+/// authenticate from the command itself failing — conflating the two used to
+/// report a working sudo as "credentials expired".
+fn describe_command_failure(
+    program: &str,
+    output: &std::process::Output,
+    interactive_sudo: bool,
+) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if program == "sudo" && is_sudo_auth_failure(&stderr) {
+        return if interactive_sudo {
+            "sudo authentication failed".to_string()
         } else {
-            std::fs::remove_file(&path)
+            "sudo credentials expired — confirm the cleanup again to re-authenticate".to_string()
         };
-        match result {
-            Ok(()) => removed += 1,
-            Err(e) => log.push(format!("! skipped {}: {e}", path.display())),
+    }
+    let detail: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
+    match detail.last() {
+        Some(last) => format!("{program} exited with {}: {}", output.status, last.trim()),
+        None => format!("{program} exited with {}", output.status),
+    }
+}
+
+/// True when sudo's own stderr says it couldn't authenticate, as opposed to
+/// the command under it failing.
+fn is_sudo_auth_failure(stderr: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "a password is required",
+        "a terminal is required",
+        "no askpass program",
+        "incorrect password",
+        "you must have a tty",
+        "is not in the sudoers file",
+        "no tty present",
+    ];
+    MARKERS.iter().any(|m| stderr.contains(m))
+}
+
+enum Removal {
+    Removed,
+    RemovedAsRoot,
+    Failed(anyhow::Error),
+}
+
+/// Remove a file or directory, escalating to `sudo rm -rf` when the direct
+/// removal fails and the path is still there. Root-owned files inside an
+/// otherwise-ours cache directory are the common case: `remove_dir_all` fails
+/// partway with EACCES or "Directory not empty", and only root can finish.
+fn remove_path(path: &Path, interactive_sudo: bool) -> Removal {
+    let is_dir = path
+        .symlink_metadata()
+        .map(|m| m.file_type().is_dir())
+        .unwrap_or(false);
+    let first = if is_dir {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    match first {
+        Ok(()) => Removal::Removed,
+        Err(e) => {
+            // Vanished under us (another process, or a partial remove that
+            // finished the job) — nothing left to do.
+            if path.symlink_metadata().is_err() {
+                return Removal::Removed;
+            }
+            if is_root() {
+                return Removal::Failed(anyhow::anyhow!("{e}"));
+            }
+            match sudo_rm(path, interactive_sudo) {
+                Ok(()) => Removal::RemovedAsRoot,
+                Err(se) => Removal::Failed(anyhow::anyhow!("{e}; sudo fallback: {se:#}")),
+            }
         }
     }
-    log.push(format!("emptied {} ({removed} entries)", dir.display()));
+}
+
+/// Remove one hand-picked path (the Overview's mark-and-delete flow),
+/// escalating to sudo when the direct removal can't finish. `try_direct` is
+/// false when the path is already known to belong to another user, so the
+/// doomed filesystem call is skipped.
+pub fn remove_marked(path: &Path, try_direct: bool, interactive_sudo: bool) -> Result<()> {
+    if path.symlink_metadata().is_err() {
+        return Ok(());
+    }
+    if !try_direct {
+        return sudo_rm(path, interactive_sudo);
+    }
+    match remove_path(path, interactive_sudo) {
+        Removal::Removed | Removal::RemovedAsRoot => Ok(()),
+        Removal::Failed(e) => Err(e),
+    }
+}
+
+fn sudo_rm(path: &Path, interactive_sudo: bool) -> Result<()> {
+    guard_recursive_delete(path)?;
+    let mut cmd = std::process::Command::new("sudo");
+    if !interactive_sudo {
+        cmd.arg("-n");
+    }
+    let output = cmd
+        .args(["rm", "-rf", "--"])
+        .arg(path)
+        .output()
+        .with_context(|| format!("running sudo rm on {}", path.display()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    bail!("{}", describe_command_failure("sudo", &output, interactive_sudo));
+}
+
+/// Refuse to hand `rm -rf` a path that would take out the system or the whole
+/// home directory, whatever a provider or a stale registry entry claims.
+fn guard_recursive_delete(path: &Path) -> Result<()> {
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if resolved.components().count() <= 1 {
+        bail!("refusing to recursively delete {}", resolved.display());
+    }
+    if let Some(home) = dirs::home_dir() {
+        if resolved == home {
+            bail!("refusing to recursively delete the home directory");
+        }
+    }
+    const FORBIDDEN: &[&str] = &[
+        "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64", "/opt", "/proc", "/root",
+        "/run", "/sbin", "/srv", "/sys", "/usr", "/var",
+    ];
+    if FORBIDDEN.iter().any(|f| resolved == Path::new(f)) {
+        bail!("refusing to recursively delete {}", resolved.display());
+    }
     Ok(())
+}
+
+/// Empty a directory without removing it. Failures are recorded per entry so
+/// one unreadable subdirectory can't strand the other forty-five.
+fn delete_contents(dir: &Path, interactive_sudo: bool, out: &mut ExecOutcome) {
+    if !dir.is_dir() {
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            // Not even listable as this user — root owns it. Sudo can still
+            // empty it in one shot.
+            if is_root() {
+                out.errors.push(format!("reading {}: {e}", dir.display()));
+                out.log.push(format!("! reading {}: {e}", dir.display()));
+                return;
+            }
+            match sudo_empty_dir(dir, interactive_sudo) {
+                Ok(()) => out.log.push(format!("emptied {} (as root)", dir.display())),
+                Err(se) => {
+                    out.errors
+                        .push(format!("reading {}: {e}; sudo fallback: {se:#}", dir.display()));
+                    out.log.push(format!(
+                        "! reading {}: {e}; sudo fallback: {se:#}",
+                        dir.display()
+                    ));
+                }
+            }
+            return;
+        }
+    };
+    let mut removed = 0u64;
+    let mut as_root = 0u64;
+    let mut failed = 0u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match remove_path(&path, interactive_sudo) {
+            Removal::Removed => removed += 1,
+            Removal::RemovedAsRoot => {
+                removed += 1;
+                as_root += 1;
+            }
+            Removal::Failed(e) => {
+                failed += 1;
+                out.errors.push(format!("{}: {e:#}", path.display()));
+                out.log.push(format!("! skipped {}: {e:#}", path.display()));
+            }
+        }
+    }
+    let mut line = format!("emptied {} ({removed} entries", dir.display());
+    if as_root > 0 {
+        line.push_str(&format!(", {as_root} as root"));
+    }
+    if failed > 0 {
+        line.push_str(&format!(", {failed} failed"));
+    }
+    line.push(')');
+    out.log.push(line);
+}
+
+/// `sudo find <dir> -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +` — empties a
+/// directory the current user can't even read, keeping the directory itself.
+fn sudo_empty_dir(dir: &Path, interactive_sudo: bool) -> Result<()> {
+    guard_recursive_delete(dir)?;
+    let mut cmd = std::process::Command::new("sudo");
+    if !interactive_sudo {
+        cmd.arg("-n");
+    }
+    let output = cmd
+        .arg("find")
+        .arg(dir)
+        .args(["-mindepth", "1", "-maxdepth", "1", "-exec", "rm", "-rf", "--", "{}", "+"])
+        .output()
+        .with_context(|| format!("running sudo find on {}", dir.display()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    bail!("{}", describe_command_failure("sudo", &output, interactive_sudo));
+}
+
+/// Real UID of the current process, read from `/proc/self/status`.
+fn own_uid() -> u32 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("Uid:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|u| u.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+/// True when a path is owned by another user, so removing it needs root.
+/// (Callers already guard on `is_root()`; a missing path needs no sudo.)
+pub fn path_needs_root(p: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::symlink_metadata(p) {
+        Ok(m) => m.uid() != own_uid(),
+        Err(_) => false,
+    }
+}
+
+/// Refreshes the sudo timestamp in the background so a long cleanup can't
+/// outlive the credentials it was authorized with. Stops on drop.
+pub struct SudoKeepalive {
+    stop: Arc<AtomicBool>,
+}
+
+impl SudoKeepalive {
+    /// Starts the refresher. No-op (returns None) when already root.
+    pub fn start() -> Option<Self> {
+        if is_root() {
+            return None;
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        std::thread::Builder::new()
+            .name("silt-sudo-keepalive".into())
+            .spawn(move || {
+                // sudo's default timestamp_timeout is 15 minutes; refreshing
+                // every 60s keeps it alive without hammering it.
+                while !flag.load(Ordering::Relaxed) {
+                    for _ in 0..60 {
+                        if flag.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                    let _ = std::process::Command::new("sudo").args(["-n", "-v"]).output();
+                }
+            })
+            .ok()?;
+        Some(Self { stop })
+    }
+}
+
+impl Drop for SudoKeepalive {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
 }
 
 pub fn is_root() -> bool {
@@ -259,4 +543,153 @@ pub fn build_registry(profile: &SystemProfile, config: &Config) -> Vec<CleanupTa
     targets.extend(containers::detect(profile));
     targets.extend(flatpak::detect(profile));
     targets
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("silt-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn target(action: CleanupAction) -> CleanupTarget {
+        CleanupTarget {
+            id: "t".into(),
+            label: "t".into(),
+            category: Category::UserCache,
+            risk: RiskTier::Safe,
+            paths: Vec::new(),
+            size_bytes: None,
+            action,
+            description: "t".into(),
+        }
+    }
+
+    #[test]
+    fn delete_paths_removes_every_path() {
+        let root = scratch("delete-paths");
+        let dirs: Vec<PathBuf> = (0..5)
+            .map(|i| {
+                let d = root.join(format!("d{i}"));
+                std::fs::create_dir_all(d.join("nested")).unwrap();
+                std::fs::write(d.join("nested/f"), b"xxxx").unwrap();
+                d
+            })
+            .collect();
+
+        let out = target(CleanupAction::DeletePaths(dirs.clone())).execute(false);
+
+        assert!(out.ok(), "unexpected errors: {:?}", out.errors);
+        for d in &dirs {
+            assert!(!d.exists(), "{} survived", d.display());
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The regression that made a 40 GiB selection reclaim 3.5 GiB: one
+    /// undeletable path used to abort the whole target with `?`, stranding
+    /// every path after it.
+    #[test]
+    fn one_failure_does_not_strand_the_rest() {
+        let root = scratch("keep-going");
+        // A directory we can't remove from: no write permission on the parent
+        // means its child can't be unlinked.
+        let locked = root.join("locked");
+        std::fs::create_dir_all(locked.join("child")).unwrap();
+        let mut perms = std::fs::metadata(&locked).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o500);
+        std::fs::set_permissions(&locked, perms).unwrap();
+
+        let after: Vec<PathBuf> = (0..3)
+            .map(|i| {
+                let d = root.join(format!("after{i}"));
+                std::fs::create_dir_all(&d).unwrap();
+                d
+            })
+            .collect();
+
+        let mut paths = vec![locked.join("child")];
+        paths.extend(after.iter().cloned());
+        target(CleanupAction::DeletePaths(paths)).execute(false);
+
+        for d in &after {
+            assert!(!d.exists(), "{} was stranded by an earlier failure", d.display());
+        }
+
+        let mut perms = std::fs::metadata(&locked).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o700);
+        std::fs::set_permissions(&locked, perms).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn delete_path_contents_keeps_the_directory() {
+        let root = scratch("contents");
+        let cache = root.join("cache");
+        std::fs::create_dir_all(cache.join("sub")).unwrap();
+        std::fs::write(cache.join("file"), b"data").unwrap();
+        std::fs::write(cache.join(".hidden"), b"data").unwrap();
+
+        let out = target(CleanupAction::DeletePathContents(vec![cache.clone()])).execute(false);
+
+        assert!(out.ok(), "unexpected errors: {:?}", out.errors);
+        assert!(cache.is_dir(), "the directory itself must survive");
+        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 0, "dotfiles too");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A failing command must still surface its command line and stderr —
+    /// they used to be dropped along with the error.
+    #[test]
+    fn failed_command_still_returns_its_log() {
+        let out = target(CleanupAction::RunCommand {
+            cmd: "sh".into(),
+            args: vec!["-c".into(), "echo boom >&2; exit 3".into()],
+            needs_root: false,
+        })
+        .execute(false);
+
+        assert!(!out.ok());
+        assert!(out.log.iter().any(|l| l.starts_with("$ sh")), "log: {:?}", out.log);
+        assert!(out.log.iter().any(|l| l.contains("boom")), "log: {:?}", out.log);
+        assert!(out.errors[0].contains("exit status: 3"), "{:?}", out.errors);
+    }
+
+    #[test]
+    fn command_failure_is_not_blamed_on_sudo() {
+        let output = std::process::Command::new("sh")
+            .args(["-c", "echo 'error: could not lock database' >&2; exit 1"])
+            .output()
+            .unwrap();
+        let msg = describe_command_failure("sudo", &output, false);
+        assert!(msg.contains("could not lock database"), "{msg}");
+        assert!(!msg.contains("credentials expired"), "{msg}");
+    }
+
+    #[test]
+    fn sudo_auth_failure_is_reported_as_such() {
+        let output = std::process::Command::new("sh")
+            .args(["-c", "echo 'sudo: a password is required' >&2; exit 1"])
+            .output()
+            .unwrap();
+        assert!(describe_command_failure("sudo", &output, false).contains("credentials expired"));
+    }
+
+    #[test]
+    fn refuses_to_recursively_delete_critical_paths() {
+        for p in ["/", "/usr", "/home", "/var", "/etc"] {
+            assert!(
+                guard_recursive_delete(Path::new(p)).is_err(),
+                "{p} must be refused"
+            );
+        }
+        if let Some(home) = dirs::home_dir() {
+            assert!(guard_recursive_delete(&home).is_err());
+            assert!(guard_recursive_delete(&home.join(".cache/foo")).is_ok());
+        }
+    }
 }

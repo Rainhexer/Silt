@@ -26,9 +26,14 @@ cargo install --git https://github.com/FlyvendeMus/Silt
 ```bash
 silt                              # interactive TUI
 silt --json --root /              # headless scan report
-silt --yes --all-safe             # clean safe targets
+silt --all-safe                   # clean safe targets
+silt --target=cache-npm           # clean one target by id
 silt --list-targets               # list what can be cleaned
 ```
+
+Headless cleanup deletes immediately — it prints the plan, then executes it.
+There is no dry-run mode. In the TUI, deletion happens only after an explicit
+`y` on the confirmation.
 
 Four tabs (Tab/Shift-Tab): **Overview** (ncdu-style drill), **Clean** (curated
 targets with risk tiers), **System** (mounts/pressure), **Log** (action log).

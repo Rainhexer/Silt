@@ -97,7 +97,6 @@ pub struct ScanLevel {
 pub struct Mark {
     pub path: PathBuf,
     pub size: u64,
-    pub is_dir: bool,
 }
 
 /// (target id, computed size). Id "\0done" marks end of sizing.
@@ -138,7 +137,7 @@ pub struct App {
     pub target_cursor: usize,
     sizing_rx: Option<Receiver<(String, u64)>>,
 
-    // Dry-run / confirm / execution.
+    // Plan / confirm / execution.
     pub confirm_pending: bool,
     pending_root_auth: bool,
 
@@ -169,6 +168,8 @@ pub struct App {
     cleanup_rx: Option<Receiver<CleanupMsg>>,
     pub cleanup_running: bool,
     reclaimed_this_run: u64,
+    /// Targets that reported at least one error in the current run.
+    cleanup_failures: usize,
     /// Bytes reclaimed across every cleanup run this session (survives past
     /// `reclaimed_this_run`, which resets per run) — feeds the farewell screen.
     pub session_reclaimed: u64,
@@ -226,6 +227,7 @@ impl App {
             cleanup_rx: None,
             cleanup_running: false,
             reclaimed_this_run: 0,
+            cleanup_failures: 0,
             session_reclaimed: 0,
             session_freed: Vec::new(),
             show_help: false,
@@ -479,13 +481,21 @@ impl App {
                 self.push_log(l);
             }
             for (id, ok, reclaimed, new_size) in done_ids {
+                // A target that failed part-way still freed whatever it got
+                // through, so credit the measured bytes either way; only a
+                // clean run clears the selection.
                 if ok {
                     self.selected.remove(&id);
-                    self.reclaimed_this_run += reclaimed;
-                    self.session_reclaimed += reclaimed;
-                    if let Some(pkg_id) = id.strip_prefix("\0pkg:") {
-                        // Package uninstall: drop it from the inventory and
-                        // credit the freed bytes to its own category.
+                } else {
+                    self.cleanup_failures += 1;
+                }
+                self.reclaimed_this_run += reclaimed;
+                self.session_reclaimed += reclaimed;
+                if let Some(pkg_id) = id.strip_prefix("\0pkg:") {
+                    // Package uninstall: drop it from the inventory and credit
+                    // the freed bytes to its own category. Only on success — a
+                    // failed uninstall leaves the package installed.
+                    if ok {
                         if let Some(pos) = self.packages.iter().position(|p| p.id == pkg_id) {
                             let p = self.packages.remove(pos);
                             if reclaimed > 0 {
@@ -497,24 +507,29 @@ impl App {
                             }
                             self.recompute_pkg_view();
                         }
-                    } else if let Some(display) = id.strip_prefix("\0mark:") {
-                        // Overview mark-and-delete: a hand-picked path, not a
-                        // registry target, so there's no CleanupTarget to
-                        // look up — file it under its own category instead.
-                        if reclaimed > 0 {
-                            self.session_freed.push((
-                                Category::Marked,
-                                display.to_string(),
-                                reclaimed,
-                            ));
-                        }
-                    } else if let Some(t) = self.targets.iter_mut().find(|t| t.id == id) {
-                        // Size was remeasured after deletion (None = no
-                        // walkable paths, so treat as fully cleared).
-                        t.size_bytes = Some(new_size.unwrap_or(0));
-                        if reclaimed > 0 {
-                            self.session_freed.push((t.category, t.label.clone(), reclaimed));
-                        }
+                    }
+                } else if let Some(display) = id.strip_prefix("\0mark:") {
+                    // Overview mark-and-delete: a hand-picked path, not a
+                    // registry target, so there's no CleanupTarget to look up —
+                    // file it under its own category instead.
+                    if reclaimed > 0 {
+                        self.session_freed.push((
+                            Category::Marked,
+                            display.to_string(),
+                            reclaimed,
+                        ));
+                    }
+                } else if let Some(t) = self.targets.iter_mut().find(|t| t.id == id) {
+                    // Size was remeasured after deletion. With no walkable
+                    // paths a clean run means fully cleared; a failed one keeps
+                    // the old estimate rather than claiming zero.
+                    match new_size {
+                        Some(n) => t.size_bytes = Some(n),
+                        None if ok => t.size_bytes = Some(0),
+                        None => {}
+                    }
+                    if reclaimed > 0 {
+                        self.session_freed.push((t.category, t.label.clone(), reclaimed));
                     }
                 }
             }
@@ -530,7 +545,17 @@ impl App {
                     level.cursor = level.cursor.min(level.entries.len().saturating_sub(1));
                 }
                 let reclaimed = self.reclaimed_this_run;
-                if reclaimed > 0 {
+                let failures = std::mem::take(&mut self.cleanup_failures);
+                // Don't report a tidy success when part of the selection never
+                // got deleted — the shortfall is the whole story.
+                if failures > 0 {
+                    let msg = format!(
+                        "Reclaimed {} — {failures} item(s) failed, see Log tab.",
+                        crate::ui::human(reclaimed)
+                    );
+                    self.push_log(msg.clone());
+                    self.set_status(StatusKind::Error, msg);
+                } else if reclaimed > 0 {
                     let msg = format!("✦ Reclaimed {}. Nice and tidy.", crate::ui::human(reclaimed));
                     self.push_log(msg.clone());
                     self.set_status(StatusKind::Success, msg);
@@ -792,7 +817,6 @@ impl App {
             self.marked.push(Mark {
                 path: entry.path,
                 size: entry.size,
-                is_dir: entry.is_dir,
             });
         }
     }
@@ -924,7 +948,7 @@ impl App {
                     );
                     return;
                 }
-                self.show_dry_run();
+                self.show_cleanup_plan();
                 self.confirm_pending = true;
             }
             _ => {}
@@ -1240,12 +1264,14 @@ impl App {
         self.cleanup_rx = Some(rx);
         self.cleanup_running = true;
         self.reclaimed_this_run = 0;
+        self.cleanup_failures = 0;
         self.push_log("--- uninstalling packages ---");
         self.set_status(StatusKind::Busy, "Uninstalling packages…");
         self.tab = Tab::Log;
         std::thread::Builder::new()
             .name("silt-uninstall".into())
             .spawn(move || {
+                let _keepalive = crate::targets::SudoKeepalive::start();
                 for pkg in victims {
                     let _ = tx.send(CleanupMsg::Line(format!(
                         ">> {} ({}, {})",
@@ -1358,7 +1384,7 @@ impl App {
         }
     }
 
-    // ---- dry run + execution ----
+    // ---- plan + execution ----
 
     pub fn selected_targets(&self) -> Vec<&CleanupTarget> {
         self.targets
@@ -1367,8 +1393,8 @@ impl App {
             .collect()
     }
 
-    fn show_dry_run(&mut self) {
-        let mut lines = vec![String::new(), "=== DRY RUN PREVIEW ===".to_string()];
+    fn show_cleanup_plan(&mut self) {
+        let mut lines = vec![String::new(), "=== CLEANUP PLAN ===".to_string()];
         let mut total: u64 = 0;
         let mut has_caution = false;
         for t in self.selected_targets() {
@@ -1378,13 +1404,14 @@ impl App {
                 t.label,
                 t.size_bytes.map(crate::ui::human).unwrap_or_else(|| "size unknown".into())
             ));
-            lines.extend(t.dry_run_preview());
+            lines.extend(t.plan_preview());
             total += t.size_bytes.unwrap_or(0);
             if t.risk == RiskTier::Caution {
                 has_caution = true;
             }
         }
         lines.push(format!("Estimated reclaim: {}", crate::ui::human(total)));
+        lines.push("This deletes for real — there is no undo.".into());
         if has_caution {
             lines.push(
                 "WARNING: selection includes Caution-tier targets that may contain real data."
@@ -1474,12 +1501,18 @@ impl App {
         self.cleanup_rx = Some(rx);
         self.cleanup_running = true;
         self.reclaimed_this_run = 0;
+        self.cleanup_failures = 0;
         self.push_log("--- executing cleanup ---");
         self.set_status(StatusKind::Busy, "Executing cleanup…");
         self.tab = Tab::Log;
         std::thread::Builder::new()
             .name("silt-cleanup".into())
             .spawn(move || {
+                // Keep the sudo timestamp fresh: a multi-gigabyte cleanup can
+                // easily outlast the 15-minute default and would otherwise
+                // start failing partway through.
+                let _keepalive = crate::targets::SudoKeepalive::start();
+                let mut failures = 0usize;
                 for target in targets {
                     let _ = tx.send(CleanupMsg::Line(format!(">> {}", target.label)));
                     // Measure real occupancy before deleting so the reported
@@ -1498,34 +1531,40 @@ impl App {
                     } else {
                         target.size_bytes.unwrap_or(0)
                     };
-                    match target.execute(interactive) {
-                        Ok(lines) => {
-                            for l in lines {
-                                let _ = tx.send(CleanupMsg::Line(format!("   {l}")));
-                            }
-                            let (reclaimed, new_size) = if has_paths {
-                                let after = sized(&target);
-                                (before.saturating_sub(after), Some(after))
-                            } else {
-                                (before, None)
-                            };
-                            let _ = tx.send(CleanupMsg::TargetDone {
-                                id: target.id.clone(),
-                                ok: true,
-                                reclaimed,
-                                new_size,
-                            });
-                        }
-                        Err(e) => {
-                            let _ = tx.send(CleanupMsg::Line(format!("   ERROR: {e:#}")));
-                            let _ = tx.send(CleanupMsg::TargetDone {
-                                id: target.id.clone(),
-                                ok: false,
-                                reclaimed: 0,
-                                new_size: None,
-                            });
-                        }
+                    // The log is emitted whether or not the target failed —
+                    // the command line and its stderr are the only way to see
+                    // why something didn't get deleted.
+                    let outcome = target.execute(interactive);
+                    for l in &outcome.log {
+                        let _ = tx.send(CleanupMsg::Line(format!("   {l}")));
                     }
+                    for e in &outcome.errors {
+                        let _ = tx.send(CleanupMsg::Line(format!("   ERROR: {e}")));
+                    }
+                    // Partial success still frees bytes, so measure regardless
+                    // of errors rather than crediting zero.
+                    let (reclaimed, new_size) = if has_paths {
+                        let after = sized(&target);
+                        (before.saturating_sub(after), Some(after))
+                    } else if outcome.ok() {
+                        (before, None)
+                    } else {
+                        (0, None)
+                    };
+                    if !outcome.ok() {
+                        failures += 1;
+                    }
+                    let _ = tx.send(CleanupMsg::TargetDone {
+                        id: target.id.clone(),
+                        ok: outcome.ok(),
+                        reclaimed,
+                        new_size,
+                    });
+                }
+                if failures > 0 {
+                    let _ = tx.send(CleanupMsg::Line(format!(
+                        "--- {failures} target(s) had failures; nothing above was a preview ---"
+                    )));
                 }
                 let _ = tx.send(CleanupMsg::AllDone);
             })
@@ -1594,43 +1633,29 @@ impl App {
         self.cleanup_rx = Some(rx);
         self.cleanup_running = true;
         self.reclaimed_this_run = 0;
+        self.cleanup_failures = 0;
         self.push_log("--- deleting marked folders ---");
         self.set_status(StatusKind::Busy, "Deleting marked folders…");
         self.tab = Tab::Log;
         std::thread::Builder::new()
             .name("silt-marked".into())
             .spawn(move || {
+                let _keepalive = crate::targets::SudoKeepalive::start();
                 for m in marks {
                     let display = m.path.display().to_string();
                     let _ = tx.send(CleanupMsg::Line(format!(">> {display}")));
-                    let needs_root = !am_root && path_needs_root(&m.path);
-                    let result: Result<()> = if needs_root {
-                        // `interactive` picks the sudo mode, mirroring the
-                        // target cleanup path: -n when credentials are cached,
-                        // a live prompt when the system won't cache.
-                        let mut cmd = std::process::Command::new("sudo");
-                        if !interactive {
-                            cmd.arg("-n");
-                        }
-                        let out = cmd
-                            .args(["rm", "-rf", "--"])
-                            .arg(&m.path)
-                            .output();
-                        match out {
-                            Ok(o) if o.status.success() => Ok(()),
-                            Ok(o) => Err(anyhow::anyhow!(
-                                "sudo rm exited with {}: {}",
-                                o.status,
-                                String::from_utf8_lossy(&o.stderr).trim()
-                            )),
-                            Err(e) => Err(anyhow::anyhow!("running sudo rm: {e}")),
-                        }
-                    } else if m.is_dir {
-                        std::fs::remove_dir_all(&m.path)
-                            .map_err(|e| anyhow::anyhow!("{e}"))
-                    } else {
-                        std::fs::remove_file(&m.path).map_err(|e| anyhow::anyhow!("{e}"))
-                    };
+                    // `remove_marked` tries the direct filesystem removal and
+                    // escalates to `sudo rm -rf` when that fails and the path
+                    // is still there — root-owned files nested inside an
+                    // otherwise-ours directory would otherwise strand it.
+                    // `interactive` picks the sudo mode, mirroring the target
+                    // cleanup path: -n when credentials are cached, a live
+                    // prompt when the system won't cache.
+                    let result = crate::targets::remove_marked(
+                        &m.path,
+                        am_root || !path_needs_root(&m.path),
+                        interactive,
+                    );
                     match result {
                         Ok(()) => {
                             let _ = tx.send(CleanupMsg::Line(format!("   removed {display}")));
@@ -1658,25 +1683,4 @@ impl App {
     }
 }
 
-/// Real UID of the current process, read from `/proc/self/status`.
-fn own_uid() -> u32 {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("Uid:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|u| u.parse().ok())
-        })
-        .unwrap_or(0)
-}
-
-/// True when a path is owned by another user, so removing it needs root.
-/// (Callers already guard on `is_root()`; a missing path needs no sudo.)
-fn path_needs_root(p: &std::path::Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    match std::fs::symlink_metadata(p) {
-        Ok(m) => m.uid() != own_uid(),
-        Err(_) => false,
-    }
-}
+use crate::targets::path_needs_root;

@@ -1,4 +1,4 @@
-//! Log tab: dry-run previews and execution log.
+//! Log tab: cleanup plans and execution log.
 
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
