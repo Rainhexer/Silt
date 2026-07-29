@@ -96,6 +96,43 @@ fn main() -> Result<()> {
     result
 }
 
+/// Persist headless session logs to `~/.local/share/silt/logs/`.
+fn save_headless_log(lines: &[String]) {
+    let Some(dir) = dirs::data_dir().map(|d| d.join("silt").join("logs")) else {
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("silt: failed to create log dir {}: {e}", dir.display());
+        return;
+    }
+    // Compute a filename once, at the end of the run.
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days = secs / 86400;
+    let t = secs % 86400;
+    let h = t / 3600;
+    let m = (t % 3600) / 60;
+    let s = t % 60;
+    let z = days as i64 + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let stamp = format!("{:04}-{:02}-{:02}T{h:02}-{m:02}-{s:02}", year, month, day);
+    let path = dir.join(format!("silt-{stamp}.log"));
+    let content = lines.join("\n") + "\n";
+    if let Err(e) = std::fs::write(&path, &content) {
+        eprintln!("silt: failed to write session log {}: {e}", path.display());
+    }
+}
+
 fn list_targets(profile: &SystemProfile, config: &Config) -> Result<()> {
     let mut registry = build_registry(profile, config);
     for t in &mut registry {
@@ -247,21 +284,31 @@ fn headless_clean(profile: &SystemProfile, config: &Config, cli: &Cli) -> Result
     // Keep the sudo timestamp alive: a large cleanup can outlast it.
     let _keepalive = targets::SudoKeepalive::start();
     let mut failures = 0usize;
+    let mut log_lines: Vec<String> = Vec::new();
+    log_lines.push(format!("Silt started — headless mode, {} target(s)", chosen.len()));
     for t in &chosen {
         println!(">> {}", t.label);
+        log_lines.push(format!(">> {}", t.label));
         // Headless runs on a real terminal, so sudo may prompt directly.
         let outcome = t.execute(true);
-        for l in outcome.log {
+        for l in &outcome.log {
             println!("   {l}");
+            log_lines.push(format!("   {l}"));
         }
         for e in &outcome.errors {
             eprintln!("   ERROR: {e}");
+            log_lines.push(format!("   ERROR: {e}"));
             failures += 1;
         }
     }
-    if failures > 0 {
-        bail!("{failures} operation(s) failed — see the log above");
-    }
-    println!("Done.");
-    Ok(())
+    let outcome = if failures > 0 {
+        let msg = format!("{failures} operation(s) failed");
+        log_lines.push(msg.clone());
+        Err(anyhow::anyhow!("{msg} — see the log above"))
+    } else {
+        log_lines.push("Done.".into());
+        Ok(())
+    };
+    save_headless_log(&log_lines);
+    outcome
 }

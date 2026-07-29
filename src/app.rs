@@ -165,6 +165,9 @@ pub struct App {
     pending_marked_auth: bool,
     pub log: Vec<String>,
     pub log_scroll: usize,
+    /// Wall-clock timestamp captured at session start, used for the log file
+    /// name so the file reflects when the session ran.
+    session_label: String,
     cleanup_rx: Option<Receiver<CleanupMsg>>,
     pub cleanup_running: bool,
     reclaimed_this_run: u64,
@@ -197,6 +200,7 @@ impl App {
             tab: Tab::Overview,
             mounts,
             started: Instant::now(),
+            session_label: session_timestamp(),
             scan_stack: Vec::new(),
             scan_state: ScanState::Idle,
             entries_visited: 0,
@@ -281,6 +285,7 @@ impl App {
                 if let Some(handle) = &self.scan_handle {
                     handle.cancel();
                 }
+                self.save_log();
                 return Ok(());
             }
         }
@@ -1684,3 +1689,55 @@ impl App {
 }
 
 use crate::targets::path_needs_root;
+
+// ---- session log persistence ----
+
+/// Format the current wall-clock time as a safe filename component.
+fn session_timestamp() -> String {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days = d / 86400;
+    let t = d % 86400;
+    let h = t / 3600;
+    let m = (t % 3600) / 60;
+    let s = t % 60;
+
+    // Civil date from a day count (Rata Die algorithm, Howard Hinnant).
+    let z = days as i64 + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+    let day = doy - (153 * mp + 2) / 5 + 1;
+
+    format!("{:04}-{:02}-{:02}T{h:02}-{m:02}-{s:02}", year, month, day)
+}
+
+/// Log directory inside the XDG data home.
+fn log_dir() -> Option<std::path::PathBuf> {
+    dirs::data_dir().map(|d| d.join("silt").join("logs"))
+}
+
+impl App {
+    /// Write the current in-memory log to a dated file under
+    /// `~/.local/share/silt/logs/`. Silently ignore failures (the log is a
+    /// convenience, not critical).
+    pub fn save_log(&self) {
+        let Some(dir) = log_dir() else { return };
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("silt: failed to create log dir {}: {e}", dir.display());
+            return;
+        }
+        let path = dir.join(format!("silt-{}.log", self.session_label));
+        let content = self.log.join("\n") + "\n";
+        if let Err(e) = std::fs::write(&path, &content) {
+            eprintln!("silt: failed to write session log {}: {e}", path.display());
+        }
+    }
+}
